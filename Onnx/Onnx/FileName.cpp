@@ -162,6 +162,39 @@ static void RunInference(const Config& config,
     const std::vector<ONNXTensorElementDataType>& types,
     Metrics& metrics)
 {
+    std::vector<const char*> input_names_char;
+    std::transform(input_names.begin(), input_names.end(),
+        std::back_inserter(input_names_char),
+        [](const auto& item)
+        {
+            return item.c_str();
+        });
+
+    std::vector<const char*> output_names_char;
+    std::transform(output_names.begin(), output_names.end(),
+        std::back_inserter(output_names_char),
+        [](const auto& item)
+        {
+            return item.c_str();
+        });
+
+    //Ort::MemoryInfo memory_info_cuda("Cuda", OrtArenaAllocator, 0, OrtMemType::OrtMemTypeDefault);
+
+    /*std::vector<std::vector<std::pair<uint32_t*, size_t>>> inputsVectorGPU;
+    inputsVectorGPU.resize(inputsVectorCPU.size());
+    for (size_t i = 0; i < inputsVectorCPU.size(); ++i)
+    {
+        auto& input = inputsVectorCPU[i];
+        auto& inputGPU = inputsVectorGPU[i];
+        inputGPU.resize(input.size());
+        for (size_t j = 0; j < input.size(); ++j)
+        {
+            auto memory = cudaMa
+        }
+    }*/
+
+
+
     for (std::uint64_t iteration = 0; iteration < config.m_iteration; ++iteration)
     {
         auto beg = high_resolution_clock::now();
@@ -222,6 +255,26 @@ static void RunInference(const Config& config,
     }
 }
 
+#include <mutex>
+#include <shared_mutex>
+std::recursive_mutex g_mutex;
+
+std::atomic_uint32_t g_count = 0;
+
+static void PrintTRTOptions(const std::unordered_map<std::string, std::string>& opts)
+{
+    std::lock_guard<decltype(g_mutex)> guard(g_mutex);
+
+    std::cout << "**********Thread Start" << std::this_thread::get_id() << std::endl;
+
+    for (auto& pair : opts)
+    {
+        std::cout << "{" << pair.first << ":" << pair.second << "}" << std::endl;
+    }
+
+    std::cout << "**********Thread Done" << std::this_thread::get_id() << std::endl;
+}
+
 static void RunCapacity(Config config)
 {
     Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "Onnx-c++-single");
@@ -237,33 +290,35 @@ static void RunCapacity(Config config)
 
     //sessionOptions.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_DISABLE_ALL);
     //sessionOptions.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
-    
+
     sessionOptions.SetIntraOpNumThreads(3);
     //sessionOptions.SetExecutionMode(ORT_PARALLEL);
 
     //sessionOptions.DisableCpuMemArena();
 
     const auto& api = Ort::GetApi();
-    
+
     // tensor RT options.
     {
         OrtTensorRTProviderOptionsV2* trtOpt = nullptr;
         api.CreateTensorRTProviderOptions(&trtOpt);
-        std::unique_ptr<OrtTensorRTProviderOptionsV2, 
+        std::unique_ptr<OrtTensorRTProviderOptionsV2,
             decltype(api.ReleaseTensorRTProviderOptions)> rel_trt_options(
-            trtOpt, api.ReleaseTensorRTProviderOptions);
+                trtOpt, api.ReleaseTensorRTProviderOptions);
         std::vector<const char*> keys;
         std::vector<const char*> values;
 
         std::transform(config.m_tensorRT.m_options.begin(),
             config.m_tensorRT.m_options.end(),
             std::back_inserter(keys),
-            [](const auto& pair){ return pair.first.c_str(); });
+            [](const auto& pair) { return pair.first.c_str(); });
 
         std::transform(config.m_tensorRT.m_options.begin(),
             config.m_tensorRT.m_options.end(),
             std::back_inserter(values),
             [](const auto& pair) { return pair.second.c_str(); });
+
+        PrintTRTOptions(config.m_tensorRT.m_options);
 
         try
         {
@@ -279,14 +334,14 @@ static void RunCapacity(Config config)
     }
 
     {
-        OrtCUDAProviderOptions cudaOptions;
-        cudaOptions.device_id = 0;
-        /*cudaOptions.gpu_mem_limit = 1024 * 1024 * 1024;
-        cudaOptions.arena_extend_strategy = 1;
-        cudaOptions.default_memory_arena_cfg;
-        cudaOptions.do_copy_in_default_stream = 1;*/
+        /*OrtCUDAProviderOptionsV2* cuda_options = nullptr;
+        api.CreateCUDAProviderOptions(&cuda_options);
+        std::unique_ptr<OrtCUDAProviderOptionsV2, decltype(api.ReleaseCUDAProviderOptions)> rel_cuda_options(cuda_options, api.ReleaseCUDAProviderOptions);
+        std::vector<const char*> keys{ "enable_cuda_graph" };
+        std::vector<const char*> values{ "1" };
+        api.UpdateCUDAProviderOptions(rel_cuda_options.get(), keys.data(), values.data(), 1);
 
-        //sessionOptions.AppendExecutionProvider_CUDA(cudaOptions);
+        sessionOptions.AppendExecutionProvider_CUDA_V2(*cuda_options);*/
     }
 
 
@@ -303,6 +358,7 @@ static void RunCapacity(Config config)
     std::cout << "*******" << config.m_modelPath << std::endl;
     std::cout << "*******" << "Total thread num " << config.m_threadNum << std::endl;
 
+    std::cout << "***** create sessions***" << std::endl;
     std::vector<Ort::Session> sessions;
     for (std::uint64_t i = 0; i < config.m_threadNum; ++i)
     {
@@ -312,12 +368,14 @@ static void RunCapacity(Config config)
             break;
     }
 
+    std::cout << "***** create sessions end***" << std::endl;
+
     Ort::AllocatorWithDefaultOptions allocator;
     std::vector<std::string> input_names;
     std::vector<ONNXTensorElementDataType> dataTypes;
 
     PrintInputDim(sessions[0], allocator, input_names, dataTypes);
-    
+
     std::vector<std::string> output_names;
     PrintOutputDim(sessions[0], allocator, output_names);
 
@@ -328,24 +386,43 @@ static void RunCapacity(Config config)
         std::cout << "******Warmup start ******" << std::endl;
         auto configWarmup = config;
 
-        configWarmup.m_iteration = 1;
-        Metrics m;
-        for (auto& session : sessions)
+        for (int i : {config.m_batchSize})
         {
-            RunInference(configWarmup, session, input_names, output_names,
-                tensors,
-                dataTypes,
-                m);
-        }
+            configWarmup.m_iteration = 1;
+            configWarmup.m_batchNum = 1;
+            configWarmup.m_batchSize = i;
+            for (auto& shape : configWarmup.m_inputShapes)
+            {
+                shape[0] = i;
+            }
 
+            Metrics m;
+
+            std::vector<std::vector<std::vector<std::uint32_t>>> warmupTensors;
+            PrepareInput(configWarmup, warmupTensors);
+            for (auto& session : sessions)
+            {
+                RunInference(configWarmup, session, input_names, output_names,
+                    warmupTensors,
+                    dataTypes,
+                    m);
+            }
+        }   
         std::cout << "******Warmup end******" << std::endl;
+        --g_count;
     }
 
     std::vector<std::thread> tasks;
-    
+
     std::vector<Metrics> metrics;
     metrics.resize(config.m_threadNum);
     std::atomic_bool stop = false;
+
+    while (g_count != 0)
+    {
+        std::cout << "Waiting count " << g_count << std::endl;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
 
     for (std::uint64_t i = 0; i < config.m_threadNum; ++i)
     {
@@ -389,14 +466,19 @@ static void RunCapacity(Config config)
             std::uint64_t latency = 0;
             // calculate total throughput
             std::uint64_t count = std::accumulate(metrics.begin(), metrics.end(),
-                0ull, 
+                0ull,
                 [&](std::uint64_t value, const auto& m)
                 {
                     latency += m.m_batchlatency;
                     return value + 1000000 / m.m_batchlatency * config.m_batchSize;
                 });
-            std::cout << "batch Latency " << latency / metrics.size() << std::endl;
-            std::cout << "Document throughput " << count << std::endl;
+
+            {
+                std::lock_guard<decltype(g_mutex)> guard(g_mutex);
+                std::cout << "thread " << std::this_thread::get_id() << std::endl;
+                std::cout << "batch Latency " << latency / metrics.size() << std::endl;
+                std::cout << "Document throughput " << count << std::endl;
+            }
         }
     }
 }
@@ -458,66 +540,74 @@ static bool GetOptionalAndLogInt(boost::optional<T>& des,
     boost::property_tree::ptree& ptree,
     const std::string& path);
 
-static Config ReadConfig(const char* configPath)
+static std::vector<Config> ReadConfig(const char* configPath)
 {
+    std::vector<Config> configs;
     std::cout << "Config file : " << configPath << std::endl;
 
-    Config config;
     try
     {
         boost::property_tree::ptree ptree;
         boost::property_tree::xml_parser::read_xml(configPath, ptree, boost::property_tree::xml_parser::no_comments);
-    
-        auto configSection = ptree.get_child_optional("Root.Model");
-        if (!configSection)
-        {
-            std::cout << "Can't find config in file" << std::endl;
-            exit(0);
-        }
 
-        GetRequired(config.m_modelPath, *configSection, "ModelPath");
-        GetOptional(config.m_threadNum, *configSection, "ThreadNum");
-        GetOptional(config.m_batchSize, *configSection, "BatchSize");
-        GetOptional(config.m_iteration, *configSection, "IterationNum");
-        GetOptional(config.m_batchNum, *configSection, "BatchNum");
-        GetOptional(config.m_useSameSession, *configSection, "UseOneSession");
+        auto rootSection = ptree.get_child("Root");
 
-        auto shapesSection = configSection->get_child("Shapes");
-        for (auto& shape : shapesSection)
+        for (auto& modelConfig : rootSection)
         {
-            config.m_inputShapes.emplace_back();
-            config.m_inputShapes.back().emplace_back(config.m_batchSize);
-            for (auto& dim : shape.second)
+            Config config;
+
+            auto configSection = &modelConfig.second;
+            GetRequired(config.m_modelPath, *configSection, "ModelPath");
+            GetOptional(config.m_threadNum, *configSection, "ThreadNum");
+            GetOptional(config.m_batchSize, *configSection, "BatchSize");
+            GetOptional(config.m_iteration, *configSection, "IterationNum");
+            GetOptional(config.m_batchNum, *configSection, "BatchNum");
+            GetOptional(config.m_useSameSession, *configSection, "UseOneSession");
+
+            auto shapesSection = configSection->get_child("Shapes");
+            for (auto& shape : shapesSection)
             {
-                config.m_inputShapes.back().emplace_back(dim.second.get_value<std::int64_t>());
+                config.m_inputShapes.emplace_back();
+                config.m_inputShapes.back().emplace_back(config.m_batchSize);
+                for (auto& dim : shape.second)
+                {
+                    config.m_inputShapes.back().emplace_back(dim.second.get_value<std::int64_t>());
+                }
+
+                std::cout << "Get shape from config " << print_shape(config.m_inputShapes.back()) << std::endl;
             }
 
-            std::cout << "Get shape from config " << print_shape(config.m_inputShapes.back()) << std::endl;
+            auto tensorRTSection = configSection->get_child_optional("TensorRT");
+            if (tensorRTSection)
+            {
+                for (auto& option : *tensorRTSection)
+                {
+                    config.m_tensorRT.m_options.emplace(
+                        option.second.get<std::string>("Key"),
+                        option.second.get<std::string>("Value")
+                    );
+                }
+            }
+
+            configs.emplace_back(config);
         }
 
-        auto tensorRTSection = configSection->get_child_optional("TensorRT");
-        if (tensorRTSection)
-        {
-            for (auto& option : *tensorRTSection)
-            {
-                config.m_tensorRT.m_options.emplace(
-                    option.second.get<std::string>("Key"),
-                    option.second.get<std::string>("Value")
-                );
-            }
-        }
     }
     catch (const std::exception& exp)
     {
-        std::cout << "Pass global hashTable config failed for " <<  exp.what() << std::endl;
+        std::cout << "Pass global hashTable config failed for " << exp.what() << std::endl;
         exit(0);
     }
 
-    return config;
+    return configs;
 }
+
+#include <stdlib.h>
 
 int main(int argc, const char** argv)
 {
+    _putenv("CUDA_FORCE_FLUSH=0");
+
     if (argc < 2)
     {
         std::cout << "No config file provided " << std::endl;
@@ -525,8 +615,16 @@ int main(int argc, const char** argv)
     }
 
     auto* configPath = argv[1];
-    Config config = ReadConfig(configPath);
-    RunCapacity(config);
+    auto configs = ReadConfig(configPath);
 
+    std::vector<std::thread> threads;
+    g_count = configs.size();
+    for (auto& config : configs)
+    {
+        threads.emplace_back(std::thread([&]()
+            {RunCapacity(config);}));
+    }
+
+    getchar();
     return 0;
 }
